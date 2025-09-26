@@ -1,3 +1,4 @@
+# run.py
 import sys
 import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,12 +11,12 @@ from torch.utils.data import DataLoader, ConcatDataset
 import numpy as np
 import threading
 import time
-from src.model import LeNet5, ResNet18Fashion
+from src.model import LeNet5, ResNet18Fashion, ResNet32
 from src.server import start_server
 from src.client import start_client
 from src.utils import non_iid_partition_dirichlet
 from src.config import GLOBAL_SEED, NUM_ROUNDS, NUM_CLIENTS, DATA_DIR, BATCH_SIZE
-from src.config import DEVICE
+from src.config import DEVICE, ADAPTOPK_T_HAT, ADAPTOPK_GAMMA, ADAPTOPK_BASE_K
 
 def load_dataset(dataset_name):
     if dataset_name.lower() == 'mnist':
@@ -40,8 +41,23 @@ def load_dataset(dataset_name):
         train_dataset = torchvision.datasets.FashionMNIST(root=DATA_DIR, train=True, download=True, transform=transform)
         test_dataset = torchvision.datasets.FashionMNIST(root=DATA_DIR, train=False, download=True, transform=transform_test)
         
+    elif dataset_name.lower() == 'cifar10':
+        transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # Change brightness/contrast/saturation
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        train_dataset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=True, transform=transform)
+        test_dataset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=False, download=True, transform=transform_test)
+        
     else:
-        raise ValueError("Dataset must be 'mnist' or 'fashion'")
+        raise ValueError("Dataset must be 'mnist', 'fashion', or 'cifar10'")
 
     return train_dataset, test_dataset
 
@@ -52,12 +68,12 @@ def run_server(global_model, selected_clients_list, algorithm, proportions, test
     print("Server finished.")
     return global_control
 
-def run_clients(global_model, selected_clients, algorithm, client_datasets, global_control, model_name):
+def run_clients(global_model, selected_clients, algorithm, client_datasets, global_control, model_name, current_round, total_rounds):
     client_threads = []
     for client_id in selected_clients:
         print(f"Starting client {client_id}...")
         seed = GLOBAL_SEED + int(client_id)
-        t = threading.Thread(target=start_client, args=(client_id, seed, client_datasets[client_id], global_model, algorithm, global_control, model_name))
+        t = threading.Thread(target=start_client, args=(client_id, seed, client_datasets[client_id], global_model, algorithm, global_control, model_name, current_round, total_rounds))
         client_threads.append(t)
         t.start()
     
@@ -69,27 +85,34 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
     
     while True:
-        algorithm = input("Enter the federated learning algorithm (fedavg, fedprox, fedsparse): ").strip().lower()
-        if algorithm in ['fedavg', 'fedprox', 'fedsparse']:
+        algorithm = input("Enter the federated learning algorithm (fedavg, fedprox, fedsparse, adaptopk, fedzip): ").strip().lower()
+        if algorithm in ['fedavg', 'fedprox', 'fedsparse', 'adaptopk', 'fedzip']:
             break
-        print("Invalid input! Please enter 'fedavg', 'fedprox', or 'fedsparse'.")
+        print("Invalid input! Please enter 'fedavg', 'fedprox', 'fedsparse', 'fedzip' ,or 'adaptopk'.")
 
     while True:
-        dataset_name = input("Enter the dataset (mnist, fashion): ").strip().lower()
-        if dataset_name in ['mnist', 'fashion']:
+        dataset_name = input("Enter the dataset (mnist, fashion, cifar10): ").strip().lower()
+        if dataset_name in ['mnist', 'fashion', 'cifar10']:
             break
-        print("Invalid input! Please enter 'mnist', or 'fashion'.")
+        print("Invalid input! Please enter 'mnist', 'fashion', or 'cifar10'.")
 
     # Automatically select the model based on the dataset
     if dataset_name.lower() == 'mnist':
         model_name = 'lenet5'
     elif dataset_name.lower() == 'fashion':
         model_name = 'resnet18fashion'
+    elif dataset_name.lower() == 'cifar10':
+        model_name = 'resnet32'
 
     print(f"Running with algorithm: {algorithm}, dataset: {dataset_name}, model: {model_name}")
 
     np.random.seed(GLOBAL_SEED)
     torch.manual_seed(GLOBAL_SEED)
+
+    # Set AdaptiveTop-K parameters if using adaptopk
+    if algorithm == 'adaptopk':
+        ADAPTOPK_T_HAT = NUM_ROUNDS // 2  # Set t_hat to half of total rounds
+        print(f"AdaptiveTop-K parameters: gamma={ADAPTOPK_GAMMA}, base_k={ADAPTOPK_BASE_K}, t_hat={ADAPTOPK_T_HAT}")
 
     train_dataset, test_dataset = load_dataset(dataset_name)
     client_datasets, proportions = non_iid_partition_dirichlet(train_dataset, NUM_CLIENTS, partition="hetero")
@@ -100,6 +123,8 @@ if __name__ == "__main__":
         global_model = LeNet5().to(DEVICE)
     elif model_name == 'resnet18fashion':
         global_model = ResNet18Fashion().to(DEVICE)        
+    elif model_name == 'resnet32':
+        global_model = ResNet32().to(DEVICE)
     
     global_control = None
 
@@ -117,7 +142,7 @@ if __name__ == "__main__":
 
     for round_num in range(NUM_ROUNDS):
         print(f"\nStarting clients for round {round_num+1}")
-        run_clients(global_model, selected_clients_list[round_num], algorithm, client_datasets, global_control, model_name)
+        run_clients(global_model, selected_clients_list[round_num], algorithm, client_datasets, global_control, model_name, round_num, NUM_ROUNDS)
         time.sleep(2)
 
     server_thread.join()
