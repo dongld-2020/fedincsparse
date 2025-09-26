@@ -27,13 +27,18 @@ BATCH_SIZE = 32
 # Tham số FedProx
 MU = 0.001
 
-# Tham số FedLiteKb
-INITIAL_RETENTION = 0.8  # Không dùng nếu cố định
-FINAL_RETENTION = 0.8    # Không dùng nếu cố định
-GROWTH_RATE = 0.0       # Không dùng nếu cố định
-#retention_factor = initial_retention + (final_retention - initial_retention) * (1 - np.exp(-growth_rate * round_num))
-#knowledge_bank[name] = retention_factor * knowledge_bank[name] + (1 - retention_factor) * sparse_delta_avg[name]
+# Tham số FedSparse
 K_PERCENT = 0.2
+
+# Tham số AdaptiveTopK
+ADAPTOPK_GAMMA = 0.5  # Scaling factor γ
+ADAPTOPK_BASE_K = 0.1  # Base sparsity level k
+ADAPTOPK_T_HAT = None  # Will be calculated based on rounds
+
+# Tham số FedZip
+FEDZIP_SPARSITY = 0.2  # Top-z sparsity (10% of weights kept)
+FEDZIP_NUM_CLUSTERS = 3  # Number of clusters for k-means quantization
+FEDZIP_ENCODING_METHOD = 'difference'  # Options: 'huffman', 'position', 'difference'
 
 # Tham số logging
 LOG_DIR = './logs'

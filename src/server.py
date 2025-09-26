@@ -9,9 +9,10 @@ import pickle
 import pandas as pd
 from .utils import evaluate_global_model
 from .config import GLOBAL_SEED, NUM_ROUNDS, SERVER_PORT, BUFFER_SIZE, NUM_CLIENTS, LOCAL_EPOCHS, ALPHA, LEARNING_RATE, setup_logger, DEVICE
-from .config import INITIAL_RETENTION, FINAL_RETENTION, GROWTH_RATE
+from .config import ADAPTOPK_GAMMA, ADAPTOPK_BASE_K, ADAPTOPK_T_HAT
+from .config import FEDZIP_SPARSITY, FEDZIP_NUM_CLUSTERS, FEDZIP_ENCODING_METHOD
 
-def aggregate_with_fedsparse(client_weights, knowledge_bank, retention_factor):
+def aggregate_with_fedsparse(client_weights, knowledge_bank):
     sparse_delta_avg = {}
     for name in client_weights[0].keys():
         weighted_sum = None
@@ -26,15 +27,66 @@ def aggregate_with_fedsparse(client_weights, knowledge_bank, retention_factor):
             weighted_sum += delta
         sparse_delta_avg[name] = weighted_sum / len(client_weights)
 
-    if knowledge_bank is None:
-        knowledge_bank = {name: torch.zeros_like(delta, device=DEVICE) for name, delta in sparse_delta_avg.items()}
+    return sparse_delta_avg
+
+def aggregate_with_adaptopk(client_weights, current_round, total_rounds):
+    """Aggregate with Adaptive Top-K algorithm"""
+    # Calculate adaptive sparsity parameters
+    if ADAPTOPK_T_HAT is None:
+        t_hat = total_rounds // 2
+    else:
+        t_hat = ADAPTOPK_T_HAT
     
+    base_k = ADAPTOPK_BASE_K
+    gamma = ADAPTOPK_GAMMA
+    
+    # Apply AdapTop-K strategy for aggregation
+    if (current_round < t_hat // 2) or (current_round >= (t_hat + total_rounds) // 2):
+        # Higher retention in early and late stages
+        retention_factor = 0.8 + 0.2 * gamma
+    else:
+        # Lower retention in middle stages  
+        retention_factor = 0.8 - 0.2 * gamma
+    
+    sparse_delta_avg = aggregate_with_fedsparse(client_weights, None)
+    
+    # Apply retention factor to the aggregated delta
     for name in sparse_delta_avg.keys():
-        if knowledge_bank[name].shape != sparse_delta_avg[name].shape:
-            raise ValueError(f"Shape mismatch for {name}: knowledge_bank {knowledge_bank[name].shape} vs sparse_delta_avg {sparse_delta_avg[name].shape}")
-        knowledge_bank[name] = retention_factor * knowledge_bank[name] + (1 - retention_factor) * sparse_delta_avg[name]
+        sparse_delta_avg[name] = sparse_delta_avg[name] * retention_factor
     
-    return knowledge_bank
+    return sparse_delta_avg
+
+def fedzip_decompress(compressed_data):
+    """Decompress FedZip compressed data on server side"""
+    from .client import fedzip_decompress
+    return fedzip_decompress(compressed_data)
+
+def aggregate_with_fedzip(client_weights, client_data_sizes):
+    """Aggregate FedZip compressed weights using FedAvg principle"""
+    # Decompress each client's weights
+    decompressed_weights = []
+    for client_weight in client_weights:
+        # Assuming fedzip_decompress is defined elsewhere
+        decompressed = fedzip_decompress(client_weight) 
+        decompressed_weights.append(decompressed)
+    
+    # Calculate weights based on client data sizes
+    total_data_size = sum(client_data_sizes)
+    weights_per_client = [data_size / total_data_size for data_size in client_data_sizes]
+    
+    # Aggregate weights using the calculated weights_per_client
+    averaged_weights = {}
+    for name in decompressed_weights[0].keys():
+        # Initialize weighted_sum for each layer
+        weighted_sum = torch.zeros_like(decompressed_weights[0][name])
+        
+        # Perform weighted aggregation
+        for i, w in enumerate(decompressed_weights):
+            weighted_sum += w[name] * weights_per_client[i]
+            
+        averaged_weights[name] = weighted_sum
+    
+    return averaged_weights
 
 def start_server(global_model, selected_clients_list, algorithm='fedavg', proportions=None, num_rounds=NUM_ROUNDS, test_loader=None, global_seed=GLOBAL_SEED, global_control=None, model_name='lenet5'):
     logger = setup_logger('server', 'server.log')
@@ -57,11 +109,8 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
     else:
         global_control = None
 
-    if algorithm.lower() == 'fedsparse':
+    if algorithm.lower() in ['fedsparse', 'adaptopk']:
         knowledge_bank = None
-        initial_retention = INITIAL_RETENTION
-        final_retention = FINAL_RETENTION
-        growth_rate = GROWTH_RATE
 
     all_metrics = []
     total_communication_cost = 0
@@ -82,7 +131,9 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
         data_to_send = {
             'global_model': global_model.state_dict(),
             'global_control': global_control if algorithm.lower() == 'scaffold' else None,
-            'model_name': model_name
+            'model_name': model_name,
+            'current_round': round_num,
+            'total_rounds': num_rounds
         }
         buffer = io.BytesIO()
         pickle.dump(data_to_send, buffer)
@@ -133,6 +184,8 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
                 data_size = received_data['data_size']
                 delta_c = received_data.get('delta_c', None)
                 is_sparse = received_data.get('is_sparse', False)
+                client_algorithm = received_data.get('algorithm', algorithm)
+                compression_method = received_data.get('compression_method', None)
 
                 with lock:
                     client_weights.append(weights)
@@ -142,7 +195,7 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
 
                 weights_size = len(pickle.dumps(weights))
                 print(f"Connection from ('127.0.0.1', {client_socket.getpeername()[1]}) - Client ID: {client_id}")
-                logger.info(f"Received data from Client {client_id}, size: {client_to_server_cost} bytes, weights size: {weights_size} bytes, client data size: {data_size}, is_sparse: {is_sparse}")
+                logger.info(f"Received data from Client {client_id}, size: {client_to_server_cost} bytes, weights size: {weights_size} bytes, client data size: {data_size}, is_sparse: {is_sparse}, algorithm: {client_algorithm}, compression: {compression_method}")
                 
                 client_socket.send(b"ACK")
             except Exception as e:
@@ -208,9 +261,17 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
                         global_control[name] = (global_control[name].to(DEVICE) + (num_selected_clients / NUM_CLIENTS) * delta_c_avg).to(DEVICE)  # Đảm bảo trên DEVICE
 
             elif algorithm.lower() == 'fedsparse':
-                retention_factor = initial_retention + (final_retention - initial_retention) * (1 - np.exp(-growth_rate * round_num))
-                logger.info(f"Round {round_num + 1} - Retention Factor: {retention_factor:.4f}")
-                knowledge_bank = aggregate_with_fedsparse(client_weights, knowledge_bank, retention_factor)
+                knowledge_bank = aggregate_with_fedsparse(client_weights, knowledge_bank)
+                current_global = global_model.state_dict()
+                for name in current_global.keys():
+                    if name in knowledge_bank:
+                        if current_global[name].shape != knowledge_bank[name].shape:
+                            raise ValueError(f"Shape mismatch: {name} - global {current_global[name].shape} vs knowledge {knowledge_bank[name].shape}")
+                        current_global[name] = (current_global[name].to(DEVICE) + knowledge_bank[name].to(DEVICE)).to(DEVICE)  # Đảm bảo trên DEVICE
+
+            elif algorithm.lower() == 'adaptopk':
+                # Use Adaptive Top-K aggregation
+                knowledge_bank = aggregate_with_adaptopk(client_weights, round_num, num_rounds)
                 current_global = global_model.state_dict()
                 for name in current_global.keys():
                     if name in knowledge_bank:
@@ -218,10 +279,19 @@ def start_server(global_model, selected_clients_list, algorithm='fedavg', propor
                             raise ValueError(f"Shape mismatch: {name} - global {current_global[name].shape} vs knowledge {knowledge_bank[name].shape}")
                         current_global[name] = (current_global[name].to(DEVICE) + knowledge_bank[name].to(DEVICE)).to(DEVICE)  # Đảm bảo trên DEVICE
                 
-                print("Loading updated state_dict into global_model...")
-                global_model.load_state_dict(current_global)
-                print("Evaluating global model...")
-                metrics = evaluate_global_model(global_model, test_loader)
+                logger.info(f"Round {round_num + 1}: Applied AdaptiveTop-K aggregation with round-specific parameters")
+
+            elif algorithm.lower() == 'fedzip':
+                # Use FedZip aggregation                                                
+                knowledge_bank = aggregate_with_fedzip(client_weights, client_data_sizes)
+                current_global = global_model.state_dict()
+                for name in current_global.keys():
+                    if name in knowledge_bank:
+                        if current_global[name].shape != knowledge_bank[name].shape:
+                            raise ValueError(f"Shape mismatch: {name} - global {current_global[name].shape} vs knowledge {knowledge_bank[name].shape}")
+                        current_global[name] = (current_global[name].to(DEVICE) + knowledge_bank[name].to(DEVICE)).to(DEVICE)  # Đảm bảo trên DEVICE
+                
+                logger.info(f"Round {round_num + 1}: Applied FedZip aggregation with sparsity={FEDZIP_SPARSITY}, clusters={FEDZIP_NUM_CLUSTERS}")
 
             global_model.load_state_dict(current_global)
             

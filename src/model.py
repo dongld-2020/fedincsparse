@@ -1,3 +1,4 @@
+# model.py
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
@@ -105,6 +106,80 @@ class ResNet18Fashion(nn.Module):
         x = self.fc(x)
         return x
         
+
+
+class BasicBlockNoBatchNormRelu(nn.Module):
+    expansion = 1  # No change in expansion for ResNet18 and ResNet32
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlockNoBatchNormRelu, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=True)
+        self.relu = nn.ReLU()  # Changed from Tanh to ReLU
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=True)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=True)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.conv1(x))  # Changed from Tanh to ReLU
+        out = self.conv2(out)
+        out += self.shortcut(x)
+        out = self.relu(out)  # Changed from Tanh to ReLU
+        return out
+        
+# Define ResNet32 for CIFAR-10
+class ResNet32(nn.Module):
+    def __init__(self, num_classes=10):  # Default for CIFAR-10
+        super(ResNet32, self).__init__()
+        self.in_planes = 32  # Starting with 16 channels
+
+        # Initial conv layer
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=True)
+        self.relu = nn.ReLU()  # Changed from Tanh to ReLU
+
+        # ResNet layers with 5 blocks per layer
+        self.layer1 = self._make_layer(BasicBlockNoBatchNormRelu, 32, 5, stride=1)
+        self.layer2 = self._make_layer(BasicBlockNoBatchNormRelu, 64, 5, stride=2)
+        self.layer3 = self._make_layer(BasicBlockNoBatchNormRelu, 128, 5, stride=2)
+
+        # Global max pooling and fully connected layer
+        self.maxpool = nn.AdaptiveMaxPool2d((1, 1))  # Changed from AdaptiveAvgPool2d to AdaptiveMaxPool2d
+        self.fc = nn.Linear(128 * BasicBlockNoBatchNorm.expansion, num_classes)
+
+        # Initialize weights with Xavier initialization
+        self._initialize_weights()
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)  # Changed from Tanh to ReLU
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.maxpool(x)  # Changed from avgpool to maxpool
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+        
 # Kiểm tra số tham số
 model = LeNet5()
 total_params = sum(p.numel() for p in model.parameters())
@@ -115,3 +190,6 @@ model = ResNet18Fashion()
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total ResNet18 Fashion parameters: {total_params}")   
 
+model = ResNet32()
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total ResNet32 for CIFAR parameters: {total_params}")
